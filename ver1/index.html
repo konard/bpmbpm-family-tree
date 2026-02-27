@@ -224,7 +224,7 @@
             </div>
         </div>
 
-        <footer>Фото из папки <code>pic/</code> (idA.png). Узел: <code>image=</code>, <code>fixedsize=true</code>, <code>imagepos=tc</code>, <code>labelloc=b</code> — фото сверху, имя и годы снизу, без наложения. Для мужчин рамка синяя, для женщин — розовая.</footer>
+        <footer>Фото из папки <code>pic/</code> (idA.png). Узел: <code>image=</code>, <code>fixedsize=true</code>, <code>imagepos=tc</code>, <code>imagescale=width</code>, <code>labelloc=b</code> — фото заполняет ширину узла сверху, имя и годы снизу, пропорция 1:2 (ширина:высота). Для мужчин рамка синяя, для женщин — розовая.</footer>
     </div>
 
     <!-- Properties panels container (fixed positioning) -->
@@ -249,12 +249,14 @@
             const photoExistsCache = {};
 
             // Node dimensions for Graphviz (in inches, at 72 DPI = 1 inch).
-            // Portrait orientation: photo on top (PHOTO_SIZE_PX square), text zone below.
-            // Width 2.0in (~144px) fits typical Russian 3-word names at font-size 11.
-            // Height = photo height (100px) + 32px for 2 text lines = 132px ≈ 1.83in.
-            const PHOTO_SIZE_PX = 100; // photo rendered at 100×100px inside node
-            const NODE_WIDTH_IN = 2.0; // wide enough for Russian 3-word names
-            const NODE_HEIGHT_IN = ((PHOTO_SIZE_PX + 32) / 72).toFixed(2) * 1; // ~1.83in
+            // Portrait orientation: height ≈ 2× width (ширина в два раза меньше высоты).
+            // Photo fills the full node width (imagescale=width scales photo to node width).
+            // Text area (name + years) occupies the lower portion of the node.
+            const NODE_WIDTH_IN = 1.6;  // portrait width (~115px) — fits Russian 2-3 word names
+            const NODE_HEIGHT_IN = 3.2; // portrait height (~230px) — ratio 2:1 (height:width)
+
+            // Cache: photo path -> {width, height} in pixels (actual file dimensions)
+            const photoDimsCache = {};
 
             const graphvizOnlineBtn = document.getElementById('graphvizOnlineBtn');
             const statusDiv = document.getElementById('status');
@@ -383,6 +385,15 @@
                 }
             }
 
+            // --- Wrap a name at the last space before the midpoint for 2-line display ---
+            // Russian 3-word names (Фамилия Имя Отчество) wrap after first word or at midpoint.
+            function wrapName(name) {
+                const words = name.trim().split(/\s+/);
+                if (words.length <= 2) return name; // short name, no wrap needed
+                // For 3 words, put first word on line 1, rest on line 2
+                return words[0] + '\\n' + words.slice(1).join(' ');
+            }
+
             // --- Generate DOT code using native image= attribute ---
             // Each node is portrait-oriented: photo at top, text label at bottom.
             // Uses fixedsize=true with width/height so Graphviz reserves exact space.
@@ -406,18 +417,19 @@
                     else if (p.sex === 'Ж' || p.sex === 'F') fillcolor = femaleColor;
 
                     const nodeId = p.idA;
-                    const labelText = `${p.label}\\n${birthYear}–${deathYear}`;
+                    const wrappedName = wrapName(p.label);
+                    const labelText = `${wrappedName}\\n${birthYear}–${deathYear}`;
 
                     const photoPath = await getPersonPhotoPath(p);
                     if (photoPath) {
-                        // Portrait node: photo at top-center at its registered size, text at bottom.
-                        // fixedsize=true locks the node to exactly width×height so layout is consistent.
-                        // imagescale=false keeps photo at registered PHOTO_SIZE_PX so it doesn't
-                        // stretch over the text area; labelloc=b places text at bottom inside node.
+                        // Portrait node: photo scales to fill full node width (imagescale=width),
+                        // text at bottom inside node (labelloc=b).
+                        // fixedsize=true locks node to exact width×height for portrait proportion.
+                        // imagepos=tc anchors photo to top-center, flush with upper border.
                         nodes.push(`  ${nodeId} [shape=box, style="filled", fillcolor="${fillcolor}", color="#2c3e50",`);
                         nodes.push(`    label="${labelText}", image="${photoPath}",`);
                         nodes.push(`    fixedsize=true, width=${NODE_WIDTH_IN}, height=${NODE_HEIGHT_IN},`);
-                        nodes.push(`    imagepos=tc, imagescale=false, labelloc=b];`);
+                        nodes.push(`    imagepos=tc, imagescale=width, labelloc=b];`);
                     } else {
                         nodes.push(`  ${nodeId} [shape=box, style="filled", fillcolor="${fillcolor}", color="#2c3e50", label="${labelText}"];`);
                     }
@@ -443,20 +455,62 @@
                 return `digraph G {\n  rankdir=TB;\n  node [fontname="Arial", fontsize=11];\n  edge [color="#5d6d7e"];\n\n${nodes.join('\n')}\n\n${edges.join('\n')}\n}`;
             }
 
+            // --- Get actual dimensions of a photo by loading it as an Image ---
+            async function getPhotoDimensions(path) {
+                if (photoDimsCache[path]) return photoDimsCache[path];
+                return new Promise(resolve => {
+                    const img = new Image();
+                    img.onload = () => {
+                        const dims = { width: img.naturalWidth, height: img.naturalHeight };
+                        photoDimsCache[path] = dims;
+                        resolve(dims);
+                    };
+                    img.onerror = () => {
+                        const dims = { width: 100, height: 100 };
+                        photoDimsCache[path] = dims;
+                        resolve(dims);
+                    };
+                    img.src = path;
+                });
+            }
+
             // --- Build images array for viz.renderString() images option ---
-            // Collects all unique photo paths used in the DOT code and registers them
-            // with square dimensions matching the node width so the photo fills the top portion.
+            // Registers each photo at its actual file dimensions so that imagescale=width
+            // scales it proportionally to fill the node width without distortion.
             async function buildImagesOption(peopleList) {
                 const imageMap = new Map(); // path -> true (deduplicate)
                 for (const p of peopleList) {
                     const photoPath = await getPersonPhotoPath(p);
                     if (photoPath) imageMap.set(photoPath, true);
                 }
-                return Array.from(imageMap.keys()).map(path => ({
-                    name: path,
-                    width: PHOTO_SIZE_PX,
-                    height: PHOTO_SIZE_PX
-                }));
+                const result = [];
+                for (const path of imageMap.keys()) {
+                    const dims = await getPhotoDimensions(path);
+                    result.push({ name: path, width: dims.width, height: dims.height });
+                }
+                return result;
+            }
+
+            // --- Fix SVG image elements after rendering ---
+            // Graphviz outputs <image> with preserveAspectRatio="xMinYMin meet" which prevents
+            // the photo from filling the allocated width. We fix this by:
+            //   1. Setting preserveAspectRatio="xMidYMin slice" so photo fills width (crops at bottom)
+            //   2. Setting height to a clipPath so the image doesn't overflow into the text area.
+            function fixSvgImageElements(svgEl) {
+                const nodeWidthPx = NODE_WIDTH_IN * 72; // node width in SVG pixels
+                // TEXT_HEIGHT: height reserved for text lines (3 lines × ~13px + padding)
+                const textHeightPx = 55;
+                const photoHeightPx = NODE_HEIGHT_IN * 72 - textHeightPx;
+
+                const images = svgEl.querySelectorAll('image');
+                images.forEach(img => {
+                    // Set width to fill node width, height to photo area height
+                    img.setAttribute('width', nodeWidthPx.toFixed(1) + 'px');
+                    img.setAttribute('height', photoHeightPx.toFixed(1) + 'px');
+                    // "xMidYMin slice": center horizontally, anchor at top, scale to fill width
+                    img.setAttribute('preserveAspectRatio', 'xMidYMin slice');
+                    // Adjust x to left edge of node (images already positioned by Graphviz)
+                });
             }
 
             // --- Render DOT code ---
@@ -469,9 +523,10 @@
                     });
                     graphvizContainer.innerHTML = svgStr;
 
-                    // Add node click handlers
+                    // Fix image elements for proper photo display
                     const svgEl = graphvizContainer.querySelector('svg');
                     if (svgEl) {
+                        fixSvgImageElements(svgEl);
                         addNodeClickHandlers(svgEl);
                     }
                 } catch (error) {
